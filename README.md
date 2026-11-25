@@ -74,23 +74,39 @@ System Settings → Shortcuts → "Wallpaper: …".
 Press **Alt+Space** and type `wallpaper`, `day` or `night`. You will find
 "Wallpaper: Day", "Wallpaper: Night", "Wallpaper: Automatic" and "Wallpaper: Toggle Day/Night".
 
-## Customising
+## Settings
 
-All settings are at the top of [`day-night-wallpaper`](day-night-wallpaper):
+Everything is set from the terminal; changes take effect right away.
 
-| Setting | What it changes |
-|---|---|
-| `LATITUDE`, `LONGITUDE` | your location, which sets the sunrise and sunset times |
-| `SCREEN_W`, `SCREEN_H`, `PANEL_LEFT` | screen size and the width of a panel on the left (the sign is centred next to it) |
-| `NEON_Y`, `NEON_X` | where the NEON sign sits on the screen |
-| `NEON_SIZE` | size of the sign: a bigger value means a closer crop (but a softer image) |
-| `SWITCH_THEME = False` | stops switching the light/dark colour scheme (so you can set it yourself) |
-| `SWITCH_LOCKSCREEN = False` | stops changing the lock screen |
-| `TRANSITION_FRAMES`, `TRANSITION_STEP_S` | length of the fade at dusk and dawn |
+```bash
+wallpaper settings                  # all settings with their current and default values
+wallpaper set theme off             # stop switching the colour scheme
+wallpaper set location 50.06 19.94  # your latitude and longitude
+wallpaper set fade 30               # 30-second fade at dusk and dawn
+wallpaper reset theme               # back to the default (or: wallpaper reset all)
+```
 
-After changing a setting or replacing `day.jpg` / `night.jpg`, the wallpapers are re-rendered automatically on the
-next run (within 5 minutes, or right away with `wallpaper auto`). If you use other images, measure the box around
-the NEON lettering and put it in `STYLE[...]["neon"]`.
+Tab completes commands, setting names and values (open a new terminal after installing).
+
+| Setting | Default | What it changes |
+|---|---|---|
+| `theme` | `on` | switch the light/dark colour scheme with the wallpaper; with `off` the scheme stays as it is |
+| `lockscreen` | `on` | show the same picture on the lock screen |
+| `location` | `52.23 21.01` | latitude and longitude for sunrise and sunset (default: Warsaw) |
+| `fade` | `19` | length of the dusk/dawn fade in seconds, or `off` |
+| `day-scheme`, `night-scheme` | `BreezeLight`, `BreezeDark` | colour scheme by day and at night (any installed scheme) |
+| `day-accent`, `night-accent` | `#4a6890`, `#d6a85c` | accent colours: the kiosk blue and the café window amber |
+| `neon-x` | `auto` | horizontal centre of the NEON sign in px; `auto` centres it next to the panel |
+| `neon-y` | `230` | vertical centre of the NEON sign in px |
+| `neon-size` | `191.4` | size of the sign in px; bigger means a closer crop and a softer image |
+| `screen` | `1920x1080` | screen size the wallpaper is rendered for |
+| `panel-left` | `44` | width of a panel on the left edge in px (`0` if you have none) |
+
+Settings are saved in `~/.config/day-night-wallpaper.conf` (only the ones you changed). You can also edit that
+file by hand; a value that doesn't make sense is ignored with a warning and the default is used.
+
+If you use other images, replace `day.jpg` / `night.jpg`, measure the box around the NEON lettering and put it in
+`NEON_BOX` at the top of the script. The wallpapers are re-rendered automatically.
 
 ## How it works
 
@@ -111,6 +127,8 @@ the NEON lettering and put it in `STYLE[...]["neon"]`.
 | `~/.local/share/day-night-wallpaper/` | rendered wallpapers, fade frames and the override file |
 | `~/.config/systemd/user/day-night-wallpaper.{service,timer}` | the timer |
 | `~/.local/share/applications/wallpaper-*.desktop` | KRunner entries, also used by the shortcuts |
+| `~/.config/day-night-wallpaper.conf` | your settings (kept by `uninstall.sh`) |
+| `~/.local/share/bash-completion/completions/wallpaper` | Tab completion |
 
 ## Troubleshooting
 
@@ -120,13 +138,20 @@ journalctl --user -u day-night-wallpaper -n 20         # recent messages
 systemctl --user list-timers day-night-wallpaper.timer # when the next check runs
 ```
 
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-This removes the timer, commands, shortcuts and rendered files. Your current wallpaper and colour scheme stay as they are.
+This removes the timer, commands, shortcuts, Tab completion and rendered files. Your current wallpaper, colour scheme
+and settings file stay as they are.
 
 ## License
 

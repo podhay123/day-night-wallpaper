@@ -1,0 +1,6 @@
+# bash completion for `wallpaper` (day-night-wallpaper). Installed by install.sh.
+_wallpaper() {
+    local cur=${COMP_WORDS[COMP_CWORD]} IFS=$'\n'
+    COMPREPLY=($(compgen -W "$(wallpaper __complete "${COMP_WORDS[@]:1:COMP_CWORD-1}" 2>/dev/null)" -- "$cur"))
+}
+complete -F _wallpaper wallpaper

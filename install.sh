@@ -24,6 +24,11 @@ ln -sfn "$REPO/day-night-wallpaper" "$BIN/day-night-wallpaper"
 for n in day night wallpaper; do ln -sfn day-night-wallpaper "$BIN/$n"; done
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "Note: add $BIN to your PATH to use the day/night/wallpaper commands." ;; esac
 
+# Tab completion for `wallpaper` (bash-completion loads it on first use)
+COMP="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
+mkdir -p "$COMP"
+ln -sfn "$REPO/completions/wallpaper" "$COMP/wallpaper"
+
 # KRunner / menu entries
 entry() { # file name exec icon keywords
   cat > "$APPS/$1" <<DESKTOP
@@ -68,4 +73,4 @@ systemctl --user enable day-night-wallpaper.service >/dev/null 2>&1
 systemctl --user enable --now day-night-wallpaper.timer >/dev/null 2>&1
 systemctl --user start --no-block day-night-wallpaper.service
 
-echo "Installed. Try: wallpaper status"
+echo "Installed. Try: wallpaper status   (open a new terminal for Tab completion)"

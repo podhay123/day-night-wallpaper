@@ -19,5 +19,8 @@ command -v kbuildsycoca5 >/dev/null && kbuildsycoca5 >/dev/null 2>&1
 for n in day-night-wallpaper day night wallpaper; do
   [[ -L "$BIN/$n" && "$(readlink -f "$BIN/$n")" == "$REPO/day-night-wallpaper" ]] && rm -f "$BIN/$n"
 done
+COMP="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
+[[ -L "$COMP/wallpaper" && "$(readlink -f "$COMP/wallpaper")" == "$REPO/completions/wallpaper" ]] && rm -f "$COMP/wallpaper"
 rm -rf "$HOME/.local/share/day-night-wallpaper"
+echo "Your settings file was kept: ${XDG_CONFIG_HOME:-$HOME/.config}/day-night-wallpaper.conf"
 echo "Uninstalled."

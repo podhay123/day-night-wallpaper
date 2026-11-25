@@ -12,51 +12,201 @@ Commands (full guide: README.md next to this script, or `wallpaper help`):
   day / night          force day / night until the next sunrise or sunset
   wallpaper auto       back to automatic mode
   wallpaper toggle     switch to the opposite mode
+  wallpaper settings   list all settings; change with `wallpaper set NAME VALUE`,
+                       undo with `wallpaper reset NAME|all`
   wallpaper            current state and list of commands
   day-night-wallpaper  (no arguments, used by the timer) apply what is due
+
+Settings are stored in ~/.config/day-night-wallpaper.conf (only changed values).
 """
+import configparser
 import fcntl
 import hashlib
 import math
+import os
 import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable, NamedTuple
 
-# --- Settings ---------------------------------------------------------------
+# --- Fixed parts ------------------------------------------------------------
 # The paintings live next to this script (in the repo); see fetch-paintings.sh.
 WALLPAPER_DIR = Path(__file__).resolve().parent
 SOURCES = {"day": WALLPAPER_DIR / "day.jpg", "night": WALLPAPER_DIR / "night.jpg"}
 
-# Location used to compute sunrise/sunset (default: Warsaw).
-LATITUDE = 52.23
-LONGITUDE = 21.01
-
-# Laptop screen and the panel on the left.
-SCREEN_W, SCREEN_H = 1920, 1080
-PANEL_LEFT = 44
-
-# Where the NEON sign goes on the wallpaper: centre (x, y) and size in screen
-# pixels (geometric mean of the lettering's width and height). A bigger size
-# means a closer crop and a softer image (the sources are 2000 px wide).
-NEON_X = PANEL_LEFT + (SCREEN_W - PANEL_LEFT) // 2   # centre of the area next to the panel
-NEON_Y = 230
-NEON_SIZE = 191.4                                    # ~1.13-1.16x upscaling
-
-STYLE = {
-    # neon = box around the NEON lettering in the source file (left, top, right, bottom)
-    "day":   dict(neon=(1003, 525, 1281, 628), scheme="BreezeLight", accent="#4a6890"),
-    "night": dict(neon=(977, 664, 1232, 770),  scheme="BreezeDark",  accent="#d6a85c"),
-}
-SWITCH_THEME = True         # switch light/dark colour scheme along with the wallpaper
-SWITCH_LOCKSCREEN = True    # same picture on the lock screen
-
-TRANSITION_FRAMES = 16      # smooth fade at dusk/dawn
-TRANSITION_STEP_S = 1.2     # ~19 s in total
+# Box around the NEON lettering in each source file (left, top, right, bottom),
+# measured on the 2000 px files from the National Gallery of Athens.
+NEON_BOX = {"day": (1003, 525, 1281, 628), "night": (977, 664, 1232, 770)}
 
 OUT_DIR = Path.home() / ".local" / "share" / "day-night-wallpaper"
 RENDER_VERSION = 2
+FADE_FRAMES = 16            # frames of the dusk/dawn fade when it is on
+
+
+# --- Settings (`wallpaper settings`, `wallpaper set NAME VALUE`) ------------
+def _on_off(v):
+    v = v.strip().lower()
+    if v in ("on", "true", "yes", "1"):
+        return "on"
+    if v in ("off", "false", "no", "0"):
+        return "off"
+    raise ValueError("expected on or off")
+
+
+def _number(v, lo, hi, what):
+    try:
+        x = float(v)
+    except ValueError:
+        raise ValueError(f"expected {what}") from None
+    if not lo <= x <= hi:
+        raise ValueError(f"expected {what} between {lo:g} and {hi:g}")
+    return f"{x:g}"
+
+
+def _location(v):
+    parts = v.replace(",", " ").split()
+    if len(parts) != 2:
+        raise ValueError("expected LATITUDE LONGITUDE, e.g. 50.06 19.94")
+    return (_number(parts[0], -90, 90, "a latitude") + " "
+            + _number(parts[1], -180, 180, "a longitude"))
+
+
+def _fade(v):
+    if v.strip().lower() in ("off", "0"):
+        return "off"
+    return _number(v, 0.1, 300, "seconds (or off)")
+
+
+def _accent(v):
+    h = v.strip().lower().lstrip("#")
+    if len(h) != 6 or any(c not in "0123456789abcdef" for c in h):
+        raise ValueError("expected a colour like #4a6890")
+    return "#" + h
+
+
+def available_schemes():
+    out = subprocess.run(["plasma-apply-colorscheme", "--list-schemes"],
+                         capture_output=True, text=True).stdout
+    return [line.split("*", 1)[1].split("(")[0].strip()
+            for line in out.splitlines() if line.strip().startswith("*")]
+
+
+def _scheme(v):
+    schemes = available_schemes()
+    for s in schemes:
+        if s.lower() == v.strip().lower():
+            return s
+    raise ValueError("expected one of: " + ", ".join(schemes))
+
+
+def _screen(v):
+    parts = v.strip().lower().split("x")
+    if len(parts) != 2 or not all(p.isdigit() and int(p) > 0 for p in parts):
+        raise ValueError("expected WIDTHxHEIGHT, e.g. 1920x1080")
+    return f"{int(parts[0])}x{int(parts[1])}"
+
+
+def _pixels(v):
+    if not v.strip().isdigit():
+        raise ValueError("expected a whole number of pixels (0 or more)")
+    return str(int(v))
+
+
+def _neon_x(v):
+    return "auto" if v.strip().lower() == "auto" else _pixels(v)
+
+
+class Setting(NamedTuple):
+    default: str
+    normalize: Callable[[str], str]
+    help: str
+
+
+SETTINGS = {
+    "theme":        Setting("on", _on_off, "switch the light/dark colour scheme with the wallpaper"),
+    "lockscreen":   Setting("on", _on_off, "show the same picture on the lock screen"),
+    "location":     Setting("52.23 21.01", _location, "latitude and longitude for sunrise/sunset"),
+    "fade":         Setting("19", _fade, "length of the dusk/dawn fade in seconds, or off"),
+    "day-scheme":   Setting("BreezeLight", _scheme, "colour scheme by day"),
+    "night-scheme": Setting("BreezeDark", _scheme, "colour scheme at night"),
+    "day-accent":   Setting("#4a6890", _accent, "accent colour by day (the kiosk blue)"),
+    "night-accent": Setting("#d6a85c", _accent, "accent colour at night (the café window amber)"),
+    "neon-x":       Setting("auto", _neon_x, "horizontal centre of the NEON sign in px, auto = next to the panel"),
+    "neon-y":       Setting("230", _pixels, "vertical centre of the NEON sign in px"),
+    "neon-size":    Setting("191.4", lambda v: _number(v, 20, 2000, "a size in px"),
+                            "size of the NEON sign in px; bigger = closer crop, softer image"),
+    "screen":       Setting("1920x1080", _screen, "screen size the wallpaper is rendered for"),
+    "panel-left":   Setting("44", _pixels, "width of a panel on the left edge in px (0 = none)"),
+}
+
+
+def config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "day-night-wallpaper.conf"
+
+
+def load_settings(warn=True) -> dict:
+    """Defaults, overridden by valid values from the settings file."""
+    values = {name: s.default for name, s in SETTINGS.items()}
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(config_path(), encoding="utf-8")
+    except configparser.Error as e:
+        if warn:
+            print(f"Ignoring unreadable settings file {config_path()}: {e}", file=sys.stderr)
+        return values
+    if cp.has_section("settings"):
+        for name, raw in cp.items("settings"):
+            if name not in SETTINGS:
+                if warn:
+                    print(f"Ignoring unknown setting '{name}' in {config_path()}", file=sys.stderr)
+                continue
+            try:
+                values[name] = SETTINGS[name].normalize(raw)
+            except ValueError as e:
+                if warn:
+                    print(f"Ignoring {name} = {raw} in {config_path()}: {e}", file=sys.stderr)
+    return values
+
+
+def save_settings(values: dict) -> None:
+    """Writes only the values that differ from the defaults (atomically)."""
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# day-night-wallpaper settings. Change them with: wallpaper set NAME VALUE",
+             "# (see `wallpaper settings`). Only values that differ from the defaults are kept.",
+             "[settings]"]
+    lines += [f"{n} = {v}" for n, v in values.items() if v != SETTINGS[n].default]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def apply_settings(values: dict) -> None:
+    """Turns settings into the module-level values the rest of the script uses."""
+    global LATITUDE, LONGITUDE, SCREEN_W, SCREEN_H, PANEL_LEFT, NEON_X, NEON_Y, NEON_SIZE
+    global SWITCH_THEME, SWITCH_LOCKSCREEN, TRANSITION_FRAMES, TRANSITION_STEP_S, STYLE
+    LATITUDE, LONGITUDE = (float(x) for x in values["location"].split())
+    SCREEN_W, SCREEN_H = (int(x) for x in values["screen"].split("x"))
+    PANEL_LEFT = int(values["panel-left"])
+    NEON_X = (PANEL_LEFT + (SCREEN_W - PANEL_LEFT) // 2 if values["neon-x"] == "auto"
+              else int(values["neon-x"]))
+    NEON_Y = int(values["neon-y"])
+    NEON_SIZE = float(values["neon-size"])
+    SWITCH_THEME = values["theme"] == "on"
+    SWITCH_LOCKSCREEN = values["lockscreen"] == "on"
+    if values["fade"] == "off":
+        TRANSITION_FRAMES, TRANSITION_STEP_S = 1, 0.0
+    else:
+        TRANSITION_FRAMES = FADE_FRAMES
+        TRANSITION_STEP_S = float(values["fade"]) / FADE_FRAMES
+    STYLE = {m: dict(neon=NEON_BOX[m], scheme=values[f"{m}-scheme"], accent=values[f"{m}-accent"])
+             for m in ("day", "night")}
+
+
+apply_settings({name: s.default for name, s in SETTINGS.items()})
 # ---------------------------------------------------------------------------
 
 ZENITH = 90.833  # official sunrise/sunset (refraction + solar disc radius)
@@ -140,7 +290,7 @@ def _render_mode(mode: str, out: Path):
 def _render_key():
     h = hashlib.sha1()
     h.update(repr((RENDER_VERSION, SCREEN_W, SCREEN_H, NEON_X, NEON_Y, NEON_SIZE,
-                   TRANSITION_FRAMES, sorted((k, sorted(v.items())) for k, v in STYLE.items()))).encode())
+                   TRANSITION_FRAMES, sorted(NEON_BOX.items()))).encode())
     for p in SOURCES.values():
         s = p.stat()
         h.update(f"{p}:{s.st_size}:{s.st_mtime_ns}".encode())
@@ -354,17 +504,22 @@ def set_override(mode):
             body = f"Until {fmt(until)}, then automatic again"
         else:
             body = f"Matches the time of day, until {fmt(until)}"
-    # run in the background via systemd so the terminal/shortcut doesn't wait ~20 s for the fade
-    r = subprocess.run(["systemctl", "--user", "start", "--no-block", "day-night-wallpaper.service"],
-                       capture_output=True, text=True)
     if sys.stdout.isatty():
         print(f"{'☀' if mode == 'day' else '☾'}  {title}. {body}.")
-        print("   The fade takes about 20 s.  Back to automatic: wallpaper auto")
+        if TRANSITION_FRAMES > 1:
+            print(f"   The fade takes about {TRANSITION_STEP_S * TRANSITION_FRAMES:.0f} s.  "
+                  "Back to automatic: wallpaper auto")
     else:
         notify(f"Wallpaper: {title.lower()}", body, ICONS[mode])
-    if r.returncode != 0:
-        return apply()
-    return 0
+    return trigger_apply()
+
+
+def trigger_apply() -> int:
+    """Applies the current state in the background via systemd, so the terminal or
+    shortcut doesn't wait for the fade. Falls back to applying right here."""
+    r = subprocess.run(["systemctl", "--user", "start", "--no-block", "day-night-wallpaper.service"],
+                       capture_output=True, text=True)
+    return apply() if r.returncode != 0 else 0
 
 
 def toggle():
@@ -386,6 +541,88 @@ def status() -> int:
     return 0
 
 
+# --- Settings commands ------------------------------------------------------
+COMMANDS = ["day", "night", "auto", "toggle", "status", "settings", "set", "reset", "help"]
+
+
+def cmd_settings(values) -> int:
+    rows = [(n, values[n], s.default, s.help) for n, s in SETTINGS.items()]
+    w1 = max(len(r[0]) for r in rows)
+    w2 = max(len(r[1]) for r in rows + [("", "VALUE", "", "")])
+    w3 = max(len(r[2]) for r in rows + [("", "", "DEFAULT", "")])
+    print(f"  {'NAME':<{w1}}  {'VALUE':<{w2}}  {'DEFAULT':<{w3}}  DESCRIPTION")
+    for name, value, default, text in rows:
+        mark = "*" if value != default else " "
+        print(f"{mark} {name:<{w1}}  {value:<{w2}}  {default:<{w3}}  {text}")
+    print(f"\n* = changed.  Change: wallpaper set NAME VALUE · undo: wallpaper reset NAME|all")
+    print(f"Saved in {config_path()}")
+    return 0
+
+
+def _unknown_setting(name) -> int:
+    print(f"Unknown setting: {name}. Settings: {', '.join(SETTINGS)}", file=sys.stderr)
+    return 2
+
+
+def cmd_set(name, words, values) -> int:
+    if not name or not words:
+        print("Usage: wallpaper set NAME VALUE   (see: wallpaper settings)", file=sys.stderr)
+        return 2
+    if name not in SETTINGS:
+        return _unknown_setting(name)
+    try:
+        value = SETTINGS[name].normalize(" ".join(words))
+    except ValueError as e:
+        print(f"Invalid value for {name}: {e}", file=sys.stderr)
+        return 2
+    values[name] = value
+    save_settings(values)
+    print(f"{name} = {value}" + ("  (default)" if value == SETTINGS[name].default else ""))
+    if name == "theme" and value == "off":
+        print("The colour scheme now stays as it is; change it yourself in System Settings.")
+    apply_settings(values)
+    return trigger_apply()
+
+
+def cmd_reset(name, values) -> int:
+    if not name:
+        print("Usage: wallpaper reset NAME|all", file=sys.stderr)
+        return 2
+    if name != "all" and name not in SETTINGS:
+        return _unknown_setting(name)
+    for n in (SETTINGS if name == "all" else [name]):
+        values[n] = SETTINGS[n].default
+        if name != "all":
+            print(f"{n} = {values[n]}  (default)")
+    if name == "all":
+        print("All settings are back to their defaults.")
+    save_settings(values)
+    apply_settings(values)
+    return trigger_apply()
+
+
+def complete(words) -> list:
+    """Candidates for the next word after `wallpaper WORDS...` (bash completion)."""
+    if not words:
+        return COMMANDS
+    if len(words) == 1 and words[0] == "set":
+        return list(SETTINGS)
+    if len(words) == 1 and words[0] == "reset":
+        return [*SETTINGS, "all"]
+    if len(words) == 2 and words[0] == "set" and words[1] in SETTINGS:
+        name = words[1]
+        if SETTINGS[name].normalize is _on_off:
+            return ["on", "off"]
+        if SETTINGS[name].normalize is _scheme:
+            return available_schemes()
+        if name == "fade":
+            return ["off", SETTINGS[name].default]
+        if name == "neon-x":
+            return ["auto"]
+        return [SETTINGS[name].default]
+    return []
+
+
 HELP = """\
 Day/night wallpaper (Tsarouchis, "Neon Cafe")
 
@@ -396,6 +633,10 @@ Day/night wallpaper (Tsarouchis, "Neon Cafe")
   wallpaper status   what is set now and when the next change happens
   wallpaper help     this help
 
+  wallpaper settings          list all settings with their values
+  wallpaper set NAME VALUE    change one, e.g.  wallpaper set theme off
+  wallpaper reset NAME|all    back to the default
+
 Keyboard shortcuts:  Meta+Shift+D day · Meta+Shift+N night · Meta+Shift+A automatic
 KRunner (Alt+Space): type "wallpaper", "day" or "night".
 Full guide: {readme}
@@ -404,8 +645,21 @@ Full guide: {readme}
 
 def main() -> int:
     prog = Path(sys.argv[0]).name
-    args = [a.lstrip("-") for a in sys.argv[1:]]
-    cmd = args[0] if args else {"day": "day", "night": "night", "wallpaper": "wallpaper"}.get(prog, "")
+    rest = sys.argv[2:]
+    cmd = (sys.argv[1].lstrip("-") if len(sys.argv) > 1
+           else {"day": "day", "night": "night", "wallpaper": "wallpaper"}.get(prog, ""))
+
+    if cmd == "__complete":
+        print("\n".join(complete(rest)))
+        return 0
+    values = load_settings()
+    apply_settings(values)
+    if cmd == "settings":
+        return cmd_settings(values)
+    if cmd == "set":
+        return cmd_set(rest[0] if rest else None, rest[1:], values)
+    if cmd == "reset":
+        return cmd_reset(rest[0] if rest else None, values)
 
     if cmd == "day":
         return set_override("day")
