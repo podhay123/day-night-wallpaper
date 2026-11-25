@@ -127,3 +127,8 @@ systemctl --user list-timers day-night-wallpaper.timer # when the next check run
 ```
 
 This removes the timer, commands, shortcuts and rendered files. Your current wallpaper and colour scheme stay as they are.
+
+## License
+
+The code is released under the [MIT License](LICENSE). The paintings by Yannis Tsarouchis are not part of this
+repository and are not covered by this license.
