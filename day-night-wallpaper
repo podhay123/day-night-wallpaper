@@ -1,0 +1,441 @@
+#!/usr/bin/python3
+"""Day/night wallpaper for KDE Plasma (Yannis Tsarouchis, "Neon Cafe").
+
+From sunrise to sunset the desktop shows day.jpg, at night night.jpg. Each
+painting is cropped to a 1920x1080 close-up so that the NEON sign sits in the
+same place and at the same size in both, and at dusk/dawn one fades into the
+other. The colour scheme (light/dark + accent taken from the painting) and the
+lock screen switch along with the wallpaper.
+
+Runs every 5 minutes via day-night-wallpaper.timer (systemd --user).
+Commands (full guide: README.md next to this script, or `wallpaper help`):
+  day / night          force day / night until the next sunrise or sunset
+  wallpaper auto       back to automatic mode
+  wallpaper toggle     switch to the opposite mode
+  wallpaper            current state and list of commands
+  day-night-wallpaper  (no arguments, used by the timer) apply what is due
+"""
+import fcntl
+import hashlib
+import math
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+# --- Settings ---------------------------------------------------------------
+# The paintings live next to this script (in the repo); see fetch-paintings.sh.
+WALLPAPER_DIR = Path(__file__).resolve().parent
+SOURCES = {"day": WALLPAPER_DIR / "day.jpg", "night": WALLPAPER_DIR / "night.jpg"}
+
+# Location used to compute sunrise/sunset (default: Warsaw).
+LATITUDE = 52.23
+LONGITUDE = 21.01
+
+# Laptop screen and the panel on the left.
+SCREEN_W, SCREEN_H = 1920, 1080
+PANEL_LEFT = 44
+
+# Where the NEON sign goes on the wallpaper: centre (x, y) and size in screen
+# pixels (geometric mean of the lettering's width and height). A bigger size
+# means a closer crop and a softer image (the sources are 2000 px wide).
+NEON_X = PANEL_LEFT + (SCREEN_W - PANEL_LEFT) // 2   # centre of the area next to the panel
+NEON_Y = 230
+NEON_SIZE = 191.4                                    # ~1.13-1.16x upscaling
+
+STYLE = {
+    # neon = box around the NEON lettering in the source file (left, top, right, bottom)
+    "day":   dict(neon=(1003, 525, 1281, 628), scheme="BreezeLight", accent="#4a6890"),
+    "night": dict(neon=(977, 664, 1232, 770),  scheme="BreezeDark",  accent="#d6a85c"),
+}
+SWITCH_THEME = True         # switch light/dark colour scheme along with the wallpaper
+SWITCH_LOCKSCREEN = True    # same picture on the lock screen
+
+TRANSITION_FRAMES = 16      # smooth fade at dusk/dawn
+TRANSITION_STEP_S = 1.2     # ~19 s in total
+
+OUT_DIR = Path.home() / ".local" / "share" / "day-night-wallpaper"
+RENDER_VERSION = 2
+# ---------------------------------------------------------------------------
+
+ZENITH = 90.833  # official sunrise/sunset (refraction + solar disc radius)
+
+
+# --- Sun --------------------------------------------------------------------
+def _sun_event(day: date, rising: bool):
+    """Sunrise/sunset time in UTC (Almanac for Computers / NOAA algorithm).
+
+    Returns a datetime, or "never_rises" / "never_sets" for polar night/day.
+    """
+    n = day.timetuple().tm_yday
+    lng_hour = LONGITUDE / 15
+    t = n + ((6 if rising else 18) - lng_hour) / 24
+
+    m = 0.9856 * t - 3.289
+    l = (m + 1.916 * math.sin(math.radians(m))
+         + 0.020 * math.sin(math.radians(2 * m)) + 282.634) % 360
+
+    ra = math.degrees(math.atan(0.91764 * math.tan(math.radians(l)))) % 360
+    ra += (math.floor(l / 90) * 90) - (math.floor(ra / 90) * 90)
+    ra /= 15
+
+    sin_dec = 0.39782 * math.sin(math.radians(l))
+    cos_dec = math.cos(math.asin(sin_dec))
+    cos_h = ((math.cos(math.radians(ZENITH)) - sin_dec * math.sin(math.radians(LATITUDE)))
+             / (cos_dec * math.cos(math.radians(LATITUDE))))
+    if cos_h > 1:
+        return "never_rises"
+    if cos_h < -1:
+        return "never_sets"
+
+    h = math.degrees(math.acos(cos_h))
+    if rising:
+        h = 360 - h
+    h /= 15
+
+    local_mean = h + ra - 0.06571 * t - 6.622
+    ut = (local_mean - lng_hour) % 24
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(hours=ut)
+
+
+def is_daytime(now: datetime):
+    today = now.astimezone().date()
+    sunrise = _sun_event(today, rising=True)
+    sunset = _sun_event(today, rising=False)
+    if sunrise == "never_rises" or sunset == "never_rises":
+        return False, sunrise, sunset
+    if sunrise == "never_sets" or sunset == "never_sets":
+        return True, sunrise, sunset
+    return sunrise <= now < sunset, sunrise, sunset
+
+
+# --- Rendering --------------------------------------------------------------
+def _rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _render_mode(mode: str, out: Path):
+    """Close-up crop: the NEON sign lands at (NEON_X, NEON_Y) with size NEON_SIZE.
+
+    Sharpness wins over exact alignment: if the crop would leave the painting,
+    it is shifted back inside (the sign then moves slightly).
+    """
+    from PIL import Image, ImageFilter
+
+    im = Image.open(SOURCES[mode]).convert("RGB")
+    w, h = im.size
+    l, t, r, b = STYLE[mode]["neon"]
+    s = math.sqrt((r - l) * (b - t)) / NEON_SIZE        # source px per screen px
+    s = min(s, w / SCREEN_W, h / SCREEN_H)
+    cw, ch = SCREEN_W * s, SCREEN_H * s
+    x0 = min(max((l + r) / 2 - NEON_X * s, 0), w - cw)
+    y0 = min(max((t + b) / 2 - NEON_Y * s, 0), h - ch)
+    img = im.resize((SCREEN_W, SCREEN_H), Image.LANCZOS, box=(x0, y0, x0 + cw, y0 + ch))
+    img = img.filter(ImageFilter.UnsharpMask(radius=0.8, percent=50, threshold=2))
+    img.save(out)
+
+
+def _render_key():
+    h = hashlib.sha1()
+    h.update(repr((RENDER_VERSION, SCREEN_W, SCREEN_H, NEON_X, NEON_Y, NEON_SIZE,
+                   TRANSITION_FRAMES, sorted((k, sorted(v.items())) for k, v in STYLE.items()))).encode())
+    for p in SOURCES.values():
+        s = p.stat()
+        h.update(f"{p}:{s.st_size}:{s.st_mtime_ns}".encode())
+    return h.hexdigest()[:10]
+
+
+def ensure_rendered():
+    """Returns ({'day': Path, 'night': Path}, [day->night fade frames])."""
+    key = _render_key()
+    finals = {m: OUT_DIR / f"{m}-{key}.png" for m in SOURCES}
+    frames = [OUT_DIR / f"fade-{key}-{i:02d}.jpg" for i in range(1, TRANSITION_FRAMES)]
+    if all(p.is_file() for p in [*finals.values(), *frames]):
+        return finals, frames
+
+    from PIL import Image
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for pattern in ("day-*.png", "night-*.png", "fade-*.jpg"):
+        for old in OUT_DIR.glob(pattern):
+            if key not in old.name:
+                old.unlink()
+    for m, p in finals.items():
+        _render_mode(m, p)
+    a, b = Image.open(finals["day"]), Image.open(finals["night"])
+    for i, p in enumerate(frames, start=1):
+        x = i / TRANSITION_FRAMES
+        Image.blend(a, b, x * x * (3 - 2 * x)).save(p, quality=92)   # smoothstep
+    return finals, frames
+
+
+# --- Plasma -----------------------------------------------------------------
+def current_wallpapers():
+    """Wallpaper path of every desktop, or None if plasmashell does not answer."""
+    script = (
+        'var o=[];desktops().forEach(function(d){'
+        'd.currentConfigGroup=["Wallpaper","org.kde.image","General"];'
+        'o.push(d.wallpaperPlugin+"|"+d.readConfig("Image"));});print(o.join("\\n"));'
+    )
+    try:
+        out = subprocess.run(
+            ["qdbus", "org.kde.plasmashell", "/PlasmaShell",
+             "org.kde.PlasmaShell.evaluateScript", script],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    res = []
+    for line in out.splitlines():
+        if "|" in line:
+            plugin, image = line.split("|", 1)
+            res.append(Path(image.removeprefix("file://")) if plugin == "org.kde.image" else None)
+    return res
+
+
+def set_wallpaper(path: Path):
+    r = subprocess.run(["plasma-apply-wallpaperimage", str(path)],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(r.stdout + r.stderr)
+
+
+def _kread(file, groups, key, default=""):
+    cmd = ["kreadconfig5", "--file", file]
+    for g in groups:
+        cmd += ["--group", g]
+    cmd += ["--key", key, "--default", default]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def _kwrite(file, groups, key, value):
+    cmd = ["kwriteconfig5", "--file", file]
+    for g in groups:
+        cmd += ["--group", g]
+    subprocess.run(cmd + ["--key", key, value], check=True)
+
+
+def apply_theme(mode: str):
+    st = STYLE[mode]
+    scheme = _kread("kdeglobals", ["General"], "ColorScheme", "BreezeLight")
+    # plasma-apply-colorscheme writes the accent straight into the colours (e.g. DecorationFocus)
+    accent = _kread("kdeglobals", ["Colors:Button"], "DecorationFocus")
+    want_accent = ",".join(str(c) for c in _rgb(st["accent"]))
+    if scheme == st["scheme"] and accent == want_accent:
+        return False
+    # with --accent-color the tool changes only the accent, so apply the scheme
+    # first (which resets the accent), then the accent
+    if scheme != st["scheme"]:
+        subprocess.run(["plasma-apply-colorscheme", st["scheme"]],
+                       capture_output=True, text=True, timeout=60)
+    subprocess.run(["plasma-apply-colorscheme", "--accent-color", st["accent"], st["scheme"]],
+                   capture_output=True, text=True, timeout=60)
+    return True
+
+
+def apply_lockscreen(path: Path):
+    grp = ["Greeter", "Wallpaper", "org.kde.image", "General"]
+    url = f"file://{path}"
+    if (_kread("kscreenlockerrc", grp, "Image") == url
+            and _kread("kscreenlockerrc", ["Greeter"], "WallpaperPlugin") == "org.kde.image"):
+        return False
+    _kwrite("kscreenlockerrc", ["Greeter"], "WallpaperPlugin", "org.kde.image")
+    _kwrite("kscreenlockerrc", grp, "Image", url)
+    _kwrite("kscreenlockerrc", grp, "FillMode", "2")
+    return True
+
+
+# --- Mode: automatic or forced ----------------------------------------------
+OVERRIDE = OUT_DIR / "override"
+ICONS = {"day": "weather-clear", "night": "weather-clear-night"}
+
+
+def fmt(event):
+    if isinstance(event, datetime):
+        return event.astimezone().strftime("%H:%M")
+    return str(event)
+
+
+def natural_mode(now):
+    return "day" if is_daytime(now)[0] else "night"
+
+
+def next_switch(now):
+    """The next sunrise or sunset after `now`."""
+    for d in (0, 1, 2):
+        day = now.astimezone().date() + timedelta(days=d)
+        for ev in (_sun_event(day, True), _sun_event(day, False)):
+            if isinstance(ev, datetime) and ev > now:
+                return ev
+    return now + timedelta(days=1)   # polar night/day
+
+
+def read_override(now):
+    try:
+        mode, until = OVERRIDE.read_text().split()
+        until = datetime.fromisoformat(until)
+    except (OSError, ValueError):
+        return None
+    if mode in SOURCES and now < until:
+        return mode, until
+    OVERRIDE.unlink(missing_ok=True)
+    return None
+
+
+def effective_mode(now=None):
+    now = now or datetime.now(timezone.utc)
+    o = read_override(now)
+    return o[0] if o else natural_mode(now)
+
+
+# --- Applying ---------------------------------------------------------------
+def apply_once(mode, finals, frames):
+    target = finals[mode]
+    other = finals["night" if mode == "day" else "day"]
+    wps = current_wallpapers()
+    if wps is None:
+        raise RuntimeError("plasmashell is not responding, will retry on the next run")
+    if not (wps and all(p == target for p in wps)):
+        if any(p == other for p in wps) and TRANSITION_FRAMES > 1:
+            seq = frames if mode == "night" else list(reversed(frames))
+            for f in seq:
+                set_wallpaper(f)
+                time.sleep(TRANSITION_STEP_S)
+        set_wallpaper(target)
+        print(f"Wallpaper set: {mode}")
+    if SWITCH_THEME and apply_theme(mode):
+        print(f"Colour scheme set: {STYLE[mode]['scheme']} {STYLE[mode]['accent']}")
+    if SWITCH_LOCKSCREEN and apply_lockscreen(target):
+        print("Lock screen set")
+
+
+def apply() -> int:
+    for p in SOURCES.values():
+        if not p.is_file():
+            print(f"Wallpaper file missing: {p}", file=sys.stderr)
+            return 1
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(OUT_DIR / ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # another instance is running and re-checks the mode when it finishes
+    finals, frames = ensure_rendered()
+    for _ in range(4):   # if the mode was changed during the fade, catch up
+        mode = effective_mode()
+        apply_once(mode, finals, frames)
+        if effective_mode() == mode:
+            break
+    return 0
+
+
+def notify(title, body, icon):
+    subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                    "--object-path", "/org/freedesktop/Notifications",
+                    "--method", "org.freedesktop.Notifications.Notify",
+                    "Wallpaper", "0", icon, title, body, "[]", "{}", "4000"],
+                   capture_output=True, timeout=10)
+
+
+def set_override(mode):
+    now = datetime.now(timezone.utc)
+    if mode is None:
+        OVERRIDE.unlink(missing_ok=True)
+        mode = natural_mode(now)
+        title, body = f"Automatic ({mode})", f"Next change at {fmt(next_switch(now))}"
+    else:
+        until = next_switch(now)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        OVERRIDE.write_text(f"{mode} {until.isoformat()}\n")
+        title = mode.capitalize()
+        if mode != natural_mode(now):
+            body = f"Until {fmt(until)}, then automatic again"
+        else:
+            body = f"Matches the time of day, until {fmt(until)}"
+    # run in the background via systemd so the terminal/shortcut doesn't wait ~20 s for the fade
+    r = subprocess.run(["systemctl", "--user", "start", "--no-block", "day-night-wallpaper.service"],
+                       capture_output=True, text=True)
+    if sys.stdout.isatty():
+        print(f"{'☀' if mode == 'day' else '☾'}  {title}. {body}.")
+        print("   The fade takes about 20 s.  Back to automatic: wallpaper auto")
+    else:
+        notify(f"Wallpaper: {title.lower()}", body, ICONS[mode])
+    if r.returncode != 0:
+        return apply()
+    return 0
+
+
+def toggle():
+    return set_override("night" if effective_mode() == "day" else "day")
+
+
+def status() -> int:
+    now = datetime.now(timezone.utc)
+    day, sunrise, sunset = is_daytime(now)
+    nat = "day" if day else "night"
+    o = read_override(now)
+    eff = o[0] if o else nat
+    print(f"{'☀' if eff == 'day' else '☾'}  Now: {eff.upper()}"
+          + (f"  (forced, until {fmt(o[1])})" if o else "  (automatic)"))
+    print(f"   Sunrise {fmt(sunrise)} · sunset {fmt(sunset)} · next change {fmt(next_switch(now))}")
+    wps = current_wallpapers()
+    print("   Wallpaper:", ", ".join(p.name if p else "other" for p in wps) if wps else "(plasmashell not responding)")
+    print("   Colour scheme:", _kread("kdeglobals", ["General"], "ColorScheme", "BreezeLight"))
+    return 0
+
+
+HELP = """\
+Day/night wallpaper (Tsarouchis, "Neon Cafe")
+
+  day                ☀ day until the next sunrise/sunset, then automatic again
+  night              ☾ night until the next sunrise/sunset, then automatic again
+  wallpaper auto     back to automatic (day from sunrise to sunset)
+  wallpaper toggle   switch to the opposite mode
+  wallpaper status   what is set now and when the next change happens
+  wallpaper help     this help
+
+Keyboard shortcuts:  Meta+Shift+D day · Meta+Shift+N night · Meta+Shift+A automatic
+KRunner (Alt+Space): type "wallpaper", "day" or "night".
+Full guide: {readme}
+"""
+
+
+def main() -> int:
+    prog = Path(sys.argv[0]).name
+    args = [a.lstrip("-") for a in sys.argv[1:]]
+    cmd = args[0] if args else {"day": "day", "night": "night", "wallpaper": "wallpaper"}.get(prog, "")
+
+    if cmd == "day":
+        return set_override("day")
+    if cmd == "night":
+        return set_override("night")
+    if cmd == "auto":
+        return set_override(None)
+    if cmd == "toggle":
+        return toggle()
+    if cmd == "status":
+        return status()
+    help_text = HELP.format(readme=WALLPAPER_DIR / "README.md")
+    if cmd in ("help", "h"):
+        print(help_text, end="")
+        return 0
+    if cmd == "wallpaper":
+        status()
+        print()
+        print(help_text, end="")
+        return 0
+    if cmd:
+        print(f"Unknown command: {cmd}\n", file=sys.stderr)
+        print(help_text, end="", file=sys.stderr)
+        return 2
+    return apply()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)

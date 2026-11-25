@@ -1,0 +1,11 @@
+[Unit]
+Description=Day/night wallpaper (day.jpg / night.jpg)
+After=plasma-plasmashell.service
+PartOf=plasma-workspace.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/day-night-wallpaper
+
+[Install]
+WantedBy=plasma-workspace.target

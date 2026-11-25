@@ -1,0 +1,6 @@
+# The paintings are still under copyright: fetch them with ./fetch-paintings.sh
+*.jpg
+*.png
+old/
+__pycache__/
+.Rhistory

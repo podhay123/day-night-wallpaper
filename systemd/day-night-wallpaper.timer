@@ -1,0 +1,11 @@
+[Unit]
+Description=Check every 5 minutes whether to switch the day/night wallpaper
+PartOf=plasma-workspace.target
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=plasma-workspace.target
